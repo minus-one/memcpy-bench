@@ -10,36 +10,43 @@
 #include <thread>
 #include <chrono>
 
-const size_t BLOCKSIZE = 512;
-#define NUM_ITERATIONS 10
-const size_t MEM_SIZE = (1 * 1024 * 1024ull); // Bytes
-const size_t CHUNK_SIZE = (32 * 1024ull); // Bytes
+//#define CPU_TIMING
+
+const size_t BLOCKSIZE = 256;
+const size_t NUM_ITERATIONS=100;
+const size_t MEM_SIZE = (1 * 1024 * 1024 * 1024ull); // 1 GiB
+const size_t CHUNK_SIZE = (32 * 1024ull); // 32 KiB
 
 StopWatchInterface *timer = NULL;
 cudaEvent_t start, stop;
 cudaStream_t copyStream[2];
 
+static uint64_t getCurNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t t = ts.tv_sec*1000*1000*1000 + ts.tv_nsec;
+  return t;
+}
 
-/***************/
-/* COPY KERNEL */
-/***************/
+struct elapsedTime {
+  float cpuTimeMs;
+  float gpuTimeMs;
+};
+
+/*************************/
+/* GPU based COPY KERNEL */
+/*************************/
 __global__ void copyKernelDouble(const double * __restrict__ d_in, double * __restrict__ d_out, const int N) {
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
   if (tid >= N) return;
-
   d_out[tid] = d_in[tid];
 }
 
 __global__ void copyKernel(const char * __restrict__ d_in, char * __restrict__ d_out, const int N) {
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
   if (tid >= N) return;
-
   d_out[tid] = d_in[tid];
 }
-
-
 
 float chunked_copykernel_htod(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize, int stream_id) 
 {
@@ -64,13 +71,10 @@ float chunked_copykernel_htod(const void *src_data, void *dst_data, size_t bytes
   return elapsedTimeInMs;
 }
 
-
-
+// Initialize the memory
 void init_memory(unsigned char* memRegion, size_t memSize)
 {
-  //initialize the memory
-  for (size_t i = 0; i < memSize/sizeof(unsigned char); i++)
-  {
+  for (size_t i = 0; i < memSize/sizeof(unsigned char); i++) {
     memRegion[i] = (unsigned char)(i & 0xff);
   }
 }
@@ -158,8 +162,6 @@ while(++ctr < 4096) {
   return elapsedTimeInMs;
 }
 
-
-
 float chunked_memcpy_htod(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize, int stream_id) 
 {
   //sdkResetTimer(&timer);
@@ -193,29 +195,6 @@ float chunked_memcpy_htod(const void *src_data, void *dst_data, size_t bytes, si
   return elapsedTimeInMs;
 }
 
-float async_memcpy_htod(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
-{
-  float elapsedTimeInMs = 0.0f;
-  for(unsigned int i = 0; i < 512; i++) {
-//  sdkResetTimer(&timer);
-//  sdkStartTimer(&timer);
-  nvtxRangePush("MEMCPY_HTOD");
-//  checkCudaErrors(cudaEventRecord(start, 0));
-  checkCudaErrors(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyHostToDevice, copyStream[0]));
-//  checkCudaErrors(cudaEventRecord(stop, 0));
-  nvtxRangePop();
-//  checkCudaErrors(cudaDeviceSynchronize());
-//  sdkStopTimer(&timer);
-//#ifdef CPU_TIMING
-//  elapsedTimeInMs = sdkGetTimerValue(&timer);
-//#else
-//  checkCudaErrors(cudaEventElapsedTime(&elapsedTimeInMs, start, stop));
-//#endif
-  //std::this_thread::sleep_for(std::chrono::microseconds(50));
-  }
-  return elapsedTimeInMs;
-}
-
 float chunked_memcpy_dtoh(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
 {
   sdkResetTimer(&timer);
@@ -243,37 +222,132 @@ float chunked_memcpy_dtoh(const void *src_data, void *dst_data, size_t bytes, si
   return elapsedTimeInMs;
 }
 
-float async_memcpy_dtoh(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
+elapsedTime copykernelint(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
 {
-  sdkResetTimer(&timer);
-  sdkStartTimer(&timer);
+  elapsedTime et;
+  uint64_t cpuStartNs = getCurNs();
+#ifdef NVTX_ON
+  nvtxRangePush("KERNELINT_MEMCPY");
+#endif
+  checkCudaErrors(cudaEventRecord(start, 0));
+  copyKernel << <(int)(ceil(static_cast<float>(bytes) / BLOCKSIZE)), BLOCKSIZE, 0, 0 >> >((char*)src_data, (char*)dst_data, bytes);
+  checkCudaErrors(cudaEventRecord(stop, 0));
+#ifdef NVTX_ON
+  nvtxRangePop();
+#endif
+  et.cpuTimeMs = static_cast<float>((getCurNs() - cpuStartNs) / 1E6);
+  checkCudaErrors(cudaDeviceSynchronize());
+  checkCudaErrors(cudaEventElapsedTime(&et.gpuTimeMs, start, stop));
+  return et;
+}
+
+elapsedTime copykerneldouble(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
+{
+  elapsedTime et;
+  uint64_t cpuStartNs = getCurNs();
+#ifdef NVTX_ON
+  nvtxRangePush("KERNELDOUBLE_MEMCPY");
+#endif
+  checkCudaErrors(cudaEventRecord(start, 0));
+  copyKernelDouble << <(int)(ceil(static_cast<float>(bytes) / 8 / BLOCKSIZE)), BLOCKSIZE, 0, 0 >> >((double*)src_data, (double*)dst_data, bytes);
+  checkCudaErrors(cudaEventRecord(stop, 0));
+#ifdef NVTX_ON
+  nvtxRangePop();
+#endif
+  et.cpuTimeMs = static_cast<float>((getCurNs() - cpuStartNs) / 1E6);
+  checkCudaErrors(cudaDeviceSynchronize());
+  checkCudaErrors(cudaEventElapsedTime(&et.gpuTimeMs, start, stop));
+  return et;
+}
+
+elapsedTime async_memcpy_htod(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
+{
+  elapsedTime et;
+  uint64_t cpuStartNs = getCurNs();
+#ifdef NVTX_ON
+  nvtxRangePush("ASYNC_MEMCPY_HTOD");
+#endif
+  checkCudaErrors(cudaEventRecord(start, 0));
+  checkCudaErrors(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyHostToDevice, 0));
+  checkCudaErrors(cudaEventRecord(stop, 0));
+#ifdef NVTX_ON
+  nvtxRangePop();
+#endif
+  et.cpuTimeMs = static_cast<float>((getCurNs() - cpuStartNs) / 1E6);
+  checkCudaErrors(cudaDeviceSynchronize());
+  checkCudaErrors(cudaEventElapsedTime(&et.gpuTimeMs, start, stop));
+  return et;
+}
+
+elapsedTime async_memcpy_dtoh(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
+{
+  elapsedTime et;
+  uint64_t cpuStartNs = getCurNs();
+#ifdef NVTX_ON
+  nvtxRangePush("ASYNC_MEMCPY_HTOD");
+#endif
   checkCudaErrors(cudaEventRecord(start, 0));
   checkCudaErrors(cudaMemcpyAsync(dst_data, src_data, bytes, cudaMemcpyDeviceToHost, 0));
   checkCudaErrors(cudaEventRecord(stop, 0));
-  checkCudaErrors(cudaDeviceSynchronize());
-  sdkStopTimer(&timer);
-  sdkResetTimer(&timer);
-  float elapsedTimeInMs = 0.0f;
-#ifdef CPU_TIMING
-  elapsedTimeInMs = sdkGetTimerValue(&timer);
-#else
-  checkCudaErrors(cudaEventElapsedTime(&elapsedTimeInMs, start, stop));
+#ifdef NVTX_ON
+  nvtxRangePop();
 #endif
-  return elapsedTimeInMs;
+  et.cpuTimeMs = static_cast<float>((getCurNs() - cpuStartNs) / 1E6);
+  checkCudaErrors(cudaDeviceSynchronize());
+  checkCudaErrors(cudaEventElapsedTime(&et.gpuTimeMs, start, stop));
+  return et;
 }
 
-void runAndTime(float (*memcpy_function)(const void*, void*, size_t, size_t), const void *src_data, void *dst_data, size_t memSize, size_t chunkSize)
+elapsedTime sync_memcpy_htod(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
 {
-  std::vector<float> timings;
+  elapsedTime et;
+  uint64_t cpuStartNs = getCurNs();
+#ifdef NVTX_ON
+  nvtxRangePush("SYNC_MEMCPY_HTOD");
+#endif
+  checkCudaErrors(cudaEventRecord(start, 0));
+  checkCudaErrors(cudaMemcpy(dst_data, src_data, bytes, cudaMemcpyHostToDevice));
+  checkCudaErrors(cudaEventRecord(stop, 0));
+#ifdef NVTX_ON
+  nvtxRangePop();
+#endif
+  et.cpuTimeMs = static_cast<float>((getCurNs() - cpuStartNs) / 1E6);
+  checkCudaErrors(cudaDeviceSynchronize());
+  checkCudaErrors(cudaEventElapsedTime(&et.gpuTimeMs, start, stop));
+  return et;
+}
+
+elapsedTime sync_memcpy_dtoh(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize) 
+{
+  elapsedTime et;
+  uint64_t cpuStartNs = getCurNs();
+#ifdef NVTX_ON
+  nvtxRangePush("ASYNC_MEMCPY_HTOD");
+#endif
+  checkCudaErrors(cudaEventRecord(start, 0));
+  checkCudaErrors(cudaMemcpy(dst_data, src_data, bytes, cudaMemcpyDeviceToHost));
+  checkCudaErrors(cudaEventRecord(stop, 0));
+#ifdef NVTX_ON
+  nvtxRangePop();
+#endif
+  et.cpuTimeMs = static_cast<float>((getCurNs() - cpuStartNs) / 1E6);
+  checkCudaErrors(cudaDeviceSynchronize());
+  checkCudaErrors(cudaEventElapsedTime(&et.gpuTimeMs, start, stop));
+  return et;
+}
+void runAndTime(std::string dutName, elapsedTime (*memcpy_function)(const void*, void*, size_t, size_t), const void *src_data, void *dst_data, size_t memSize, size_t chunkSize)
+{
+  std::vector<elapsedTime> timingsInMs;
   for(unsigned int i = 0; i < NUM_ITERATIONS; i++) {
-    float time_memcpy = memcpy_function(src_data, dst_data, memSize, chunkSize);
-    timings.push_back(time_memcpy);
+    elapsedTime time_memcpy = memcpy_function(src_data, dst_data, memSize, chunkSize);
+    timingsInMs.push_back(time_memcpy);
   }
-  double sum_timing = 0.0f;
-  for(auto& timing :timings) {
-    sum_timing += timing;
+  double sum_gpu_timing = 0.0f, sum_cpu_timing = 0.0f;
+  for(auto& timing :timingsInMs) {
+    sum_cpu_timing += timing.cpuTimeMs;
+    sum_gpu_timing += timing.gpuTimeMs;
   }
-  std::cout<< memSize << ", " << chunkSize << ", "<< static_cast<double>(sum_timing/NUM_ITERATIONS) << "\n";
+  std::cout<< dutName << ", " << memSize << ", " << chunkSize << ", "<< static_cast<double>(sum_cpu_timing/NUM_ITERATIONS) << ", " << static_cast<double>(sum_gpu_timing/NUM_ITERATIONS) <<"\n";
 }
 
 int main(const int argc, const char** argv)
@@ -286,76 +360,73 @@ int main(const int argc, const char** argv)
   unsigned char *h1_data = NULL;
   unsigned char *h2_data = NULL;
   size_t memSize = MEM_SIZE ;
+  
   size_t chunkSize = CHUNK_SIZE;
-
   bool chunkedTransfer = false;
+  
   bool htod = false;
   bool dtoh = false;
 
-  int lowP=0, highP =0;
-  checkCudaErrors(cudaDeviceGetStreamPriorityRange(&lowP, &highP));
-  std::cout<<lowP<< " "<< highP << "\n";
-  cudaStreamCreateWithPriority(&copyStream[0], cudaStreamNonBlocking, lowP);
-  cudaStreamCreateWithPriority(&copyStream[1], cudaStreamNonBlocking, highP);
+  //int lowP=0, highP =0;
+  //checkCudaErrors(cudaDeviceGetStreamPriorityRange(&lowP, &highP));
+  //cudaStreamCreateWithPriority(&copyStream[0], cudaStreamNonBlocking, lowP);
+  //cudaStreamCreateWithPriority(&copyStream[1], cudaStreamNonBlocking, highP);
 
-  if (checkCmdLineFlag(argc, (const char **)argv, "memSize"))
-  {
+  if (checkCmdLineFlag(argc, (const char **)argv, "memSize")) {
     memSize = getCmdLineArgumentInt(argc, argv, "memSize");
-//    std::cout<< "> Buffer size: "<< memSize << "\n";
-
-    if (memSize <= 0)
-    {
+    std::cout<< "> Buffer size: "<< memSize << "\n";
+    if (memSize <= 0) {
       printf("Illegal argument - memSize must be greater than zero\n");
       return -4000;
     }
   }
 
-  if (checkCmdLineFlag(argc, (const char **)argv, "chunkSize"))
-  {
+  if (checkCmdLineFlag(argc, (const char **)argv, "chunkSize")) {
     chunkSize = getCmdLineArgumentInt(argc, argv, "chunkSize");
-//    std::cout<< "> Chunk size: " << chunkSize << "\n";
+    std::cout<< "> Chunk size: " << chunkSize << "\n";
     chunkedTransfer = true;
-    if (chunkSize <= 0)
-    {
+    if (chunkSize <= 0) {
       printf("Illegal argument - chunkSize must be greater than zero\n");
       return -4000;
     }
   }
 
-  if (checkCmdLineFlag(argc, (const char **)argv, "htod"))
-  {
+  if (checkCmdLineFlag(argc, (const char **)argv, "htod")) {
     htod = true;
   }
-  if (checkCmdLineFlag(argc, (const char **)argv, "dtoh"))
-  {
+  if (checkCmdLineFlag(argc, (const char **)argv, "dtoh")) {
     dtoh = true;
   }
   
   std::cout<<"> Allocating host data\n";
-  cudaHostAlloc((void **)&h1_data, memSize, cudaHostAllocWriteCombined);
-  cudaHostAlloc((void **)&h2_data, memSize, cudaHostAllocWriteCombined);
+  cudaHostAlloc((void **)&h1_data, MEM_SIZE, cudaHostAllocWriteCombined);
+  cudaHostAlloc((void **)&h2_data, MEM_SIZE, cudaHostAllocWriteCombined);
   std::cout<<"> Initializing host data\n";
-  init_memory(h1_data, memSize);
-  init_memory(h2_data, memSize);
+  init_memory(h1_data, MEM_SIZE);
+  init_memory(h2_data, MEM_SIZE);
 
   std::cout<<"> Allocating device data\n";
   unsigned char *d1_data = NULL;
-  cudaMalloc((void **) & d1_data, memSize);
+  cudaMalloc((void **) & d1_data, MEM_SIZE);
   unsigned char *d2_data = NULL;
-  cudaMalloc((void **) & d2_data, memSize);
+  cudaMalloc((void **) & d2_data, MEM_SIZE);
+
   std::cout<<"> Allocated, warming up!\n";
   // WARMUP
   for(unsigned int i = 0 ; i < 10 ; i++) {
-    //async_memcpy_htod(h1_data, d1_data, memSize, 0);
-    //async_memcpy_htod(h2_data, d2_data, memSize, 0);
+    sync_memcpy_htod(h1_data, d1_data, 1024, 0);
+    sync_memcpy_dtoh(d1_data, h1_data, 1024, 0);
+    async_memcpy_htod(h1_data, d1_data, 1024, 0);
+    async_memcpy_dtoh(d1_data, h1_data, 1024, 0);
+    copykernelint(h1_data, d1_data, 1024, 0);
+    copykerneldouble(h1_data, d1_data, 1024, 0);
+    copykernelint(d1_data, h1_data, 1024, 0);
+    copykerneldouble(d1_data, h1_data, 1024, 0);
     //chunked_memcpy_htod(h_data, d_data, memSize, chunkSize);
-    //async_memcpy_dtoh(d_data, h_data, memSize, 0);
     //chunked_memcpy_dtoh(d_data, h_data, memSize, chunkSize);
   }
   std::cout << "> Warmed up!\n";
 
-  sdkResetTimer(&timer);
-  sdkStartTimer(&timer);
   //multi_chunked_memcpy_htod(h1_data, h2_data, d1_data, d2_data, memSize, chunkSize);
   //std::thread t1(chunked_memcpy_htod, h1_data, d1_data, memSize, chunkSize, -1);
   //std::thread t2(async_memcpy_htod, h1_data, d1_data, memSize, chunkSize);
@@ -363,31 +434,49 @@ int main(const int argc, const char** argv)
   //chunked_memcpy_htod(h1_data, d1_data, memSize, chunkSize, -1);
   //async_memcpy_htod(h1_data, d1_data, memSize, chunkSize);
   //chunked_memcpy_htod(h1_data, d1_data, memSize, chunkSize, 1);
-  chunked_copykernel_htod(h1_data, d1_data, memSize, chunkSize, 0);
-  chunked_copykernel_htod(h2_data, d2_data, memSize, chunkSize, 1);
+  //chunked_copykernel_htod(h1_data, d1_data, memSize, chunkSize, 0);
+  //chunked_copykernel_htod(h2_data, d2_data, memSize, chunkSize, 1);
   //chunked_memcpy_htod(h1_data, d1_data, memSize, chunkSize, 1);
   //chunked_memcpy_htod(h2_data, d2_data, memSize, chunkSize, -1);
   //t1.join();
   //t2.join();
-  checkCudaErrors(cudaDeviceSynchronize());
-  sdkStopTimer(&timer);
-  std::cout<< "memcpy Took: " << sdkGetTimerValue(&timer) <<" ms\n";
-/*
+  //std::cout<< "memcpy Took: " << sdkGetTimerValue(&timer) <<" ms\n";
 
+  std::cout<< "DUT" << ", " << "MemSize" << ", " << "ChunkSize" << ", "<< "Mean CPU-Time(ms)" << ", " << "Mean GPU-Time(ms)" << "\n";
   if(chunkedTransfer) {
     if(htod) {
-      runAndTime(chunked_memcpy_htod, h_data, d_data, memSize, chunkSize);
+      //runAndTime("CHUNKED_MEMCPY_HTOD", chunked_memcpy_htod, h_data, d_data, memSize, chunkSize);
     }
     if(dtoh) {
-      runAndTime(chunked_memcpy_dtoh, d_data, h_data, memSize, chunkSize);
+      //runAndTime("CHUNKED_MEMCPY_DTOH", chunked_memcpy_dtoh, d_data, h_data, memSize, chunkSize);
     }
   } else {
     if(htod) {
-      runAndTime(async_memcpy_htod, h_data, d_data, memSize, 0);
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("SYNC_MEMCPY_HTOD", sync_memcpy_htod, h1_data, d1_data, memSize, 0);
+
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("ASYNC_MEMCPY_HTOD", async_memcpy_htod, h1_data, d1_data, memSize, 0);
+      
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("COPYKERNELINT_MEMCPY_HTOD", copykernelint, h1_data, d1_data, memSize, 0);
+      
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("COPYKERNELDOUBLE_MEMCPY_HTOD", copykerneldouble, h1_data, d1_data, memSize, 0);
     }
     if(dtoh) {
-      runAndTime(async_memcpy_htod, d_data, h_data, memSize, 0);
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("SYNC_MEMCPY_DTOH", sync_memcpy_dtoh, d1_data, h1_data, memSize, 0);  for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2);
+ 
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("ASYNC_MEMCPY_DTOH", async_memcpy_dtoh, d1_data, h1_data, memSize, 0);  for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2);
+      
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("COPYKERNELINT_MEMCPY_DTOH", copykernelint, d1_data, h1_data, memSize, 0);
+      
+      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+        runAndTime("COPYKERNELDOUBLE_MEMCPY_DTOH", copykerneldouble, d1_data, h1_data, memSize, 0);
     }
   }
-  */
+  std::cout<<"> Benchmark complete!\n";
 }
