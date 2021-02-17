@@ -48,6 +48,10 @@ __global__ void copyKernel(const char * __restrict__ d_in, char * __restrict__ d
   d_out[tid] = d_in[tid];
 }
 
+//__global__ void copyKernelAsync(void* d_in, void* d_out, size_t bytes) {
+//  memcpy(d_in, d_out, bytes, cudaMemcpyDeviceToDevice);
+//}
+
 float chunked_copykernel_htod(const void *src_data, void *dst_data, size_t bytes, size_t chunkSize, int stream_id) 
 {
   size_t offset = 0, transferSize = 0;
@@ -400,7 +404,8 @@ int main(const int argc, const char** argv)
   
   std::cout<<"> Allocating host data\n";
   cudaHostAlloc((void **)&h1_data, MEM_SIZE, cudaHostAllocWriteCombined);
-  cudaHostAlloc((void **)&h2_data, MEM_SIZE, cudaHostAllocWriteCombined);
+  //cudaHostAlloc((void **)&h2_data, MEM_SIZE, cudaHostAllocWriteCombined);
+  h2_data = (unsigned char*)malloc(MEM_SIZE);
   std::cout<<"> Initializing host data\n";
   init_memory(h1_data, MEM_SIZE);
   init_memory(h2_data, MEM_SIZE);
@@ -414,8 +419,8 @@ int main(const int argc, const char** argv)
   std::cout<<"> Allocated, warming up!\n";
   // WARMUP
   for(unsigned int i = 0 ; i < 10 ; i++) {
-    sync_memcpy_htod(h1_data, d1_data, 1024, 0);
-    sync_memcpy_dtoh(d1_data, h1_data, 1024, 0);
+    sync_memcpy_htod(h2_data, d1_data, 1024, 0);
+    sync_memcpy_dtoh(d1_data, h2_data, 1024, 0);
     async_memcpy_htod(h1_data, d1_data, 1024, 0);
     async_memcpy_dtoh(d1_data, h1_data, 1024, 0);
     copykernelint(h1_data, d1_data, 1024, 0);
@@ -453,29 +458,29 @@ int main(const int argc, const char** argv)
   } else {
     if(htod) {
       for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
-        runAndTime("SYNC_MEMCPY_HTOD", sync_memcpy_htod, h1_data, d1_data, memSize, 0);
+        runAndTime("SYNC_MEMCPY_HTOD", sync_memcpy_htod, h2_data, d1_data, memSize, 0);
 
       for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
         runAndTime("ASYNC_MEMCPY_HTOD", async_memcpy_htod, h1_data, d1_data, memSize, 0);
       
-      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
-        runAndTime("COPYKERNELINT_MEMCPY_HTOD", copykernelint, h1_data, d1_data, memSize, 0);
-      
-      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
-        runAndTime("COPYKERNELDOUBLE_MEMCPY_HTOD", copykerneldouble, h1_data, d1_data, memSize, 0);
+      //for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+      //  runAndTime("COPYKERNELINT_MEMCPY_HTOD", copykernelint, h1_data, d1_data, memSize, 0);
+      //
+      //for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+      //  runAndTime("COPYKERNELDOUBLE_MEMCPY_HTOD", copykerneldouble, h1_data, d1_data, memSize, 0);
     }
     if(dtoh) {
       for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
-        runAndTime("SYNC_MEMCPY_DTOH", sync_memcpy_dtoh, d1_data, h1_data, memSize, 0);  for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2);
+        runAndTime("SYNC_MEMCPY_DTOH", sync_memcpy_dtoh, d1_data, h2_data, memSize, 0);  for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2);
  
       for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
         runAndTime("ASYNC_MEMCPY_DTOH", async_memcpy_dtoh, d1_data, h1_data, memSize, 0);  for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2);
       
-      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
-        runAndTime("COPYKERNELINT_MEMCPY_DTOH", copykernelint, d1_data, h1_data, memSize, 0);
-      
-      for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
-        runAndTime("COPYKERNELDOUBLE_MEMCPY_DTOH", copykerneldouble, d1_data, h1_data, memSize, 0);
+      //for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+      //  runAndTime("COPYKERNELINT_MEMCPY_DTOH", copykernelint, d1_data, h1_data, memSize, 0);
+      //
+      //for(size_t memSize = 1 ; memSize <= MEM_SIZE ; memSize = memSize * 2)
+      //  runAndTime("COPYKERNELDOUBLE_MEMCPY_DTOH", copykerneldouble, d1_data, h1_data, memSize, 0);
     }
   }
   std::cout<<"> Benchmark complete!\n";
